@@ -1,0 +1,3 @@
+libraries/Adafruit_Motor_Shield_R4_Compatible
+libraries/Arduino_SpiNINA
+libraries/WiFiNINA
