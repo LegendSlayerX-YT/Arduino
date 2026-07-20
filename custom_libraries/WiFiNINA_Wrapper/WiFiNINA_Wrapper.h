@@ -4,7 +4,7 @@
 #include <SPI.h>
 #include <WiFiNINA.h>
 
-struct Request {
+struct Request { 
     // HTTP code, -1 means no data
     int code;
     String method;

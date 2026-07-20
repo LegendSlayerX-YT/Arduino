@@ -96,7 +96,7 @@ struct SpeedControl {
 
     void apply_speed(const Speed& speed) {
         for (int i = 0; i< 4; i++) {
-            float abs_speed = fabs(speed[i]);
+            float abs_speed = min(fabs(speed[i]), 1);
             if (abs_speed < 1e-3) {
                 motor[i].run(RELEASE);
                 continue;
