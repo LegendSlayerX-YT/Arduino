@@ -18,10 +18,11 @@ Usage:
     (find the IP from the ESP32's serial monitor output on boot)
 
     python tracker.py --host 192.168.1.50 --class-id 32   # track a sports ball instead
+    python tracker.py --host 192.168.1.50 --select-roi     # drag a box around the object to track
     python tracker.py --list-classes                       # print COCO class id -> name
 
 Controls:
-    r - clear the current lock (re-acquire nearest-to-center target)
+    r - freeze the frame and drag a box around a new target to lock onto
     q - quit
 
 If the feed is too dark, try (AI-Thinker board has an onboard flash LED):
@@ -131,6 +132,56 @@ def parse_detections(results):
     return list(zip(xyxy, ids))
 
 
+def iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def select_target_class(detector, frame, conf, device):
+    """Lets the user drag a box around the object to track on the given frame,
+    then matches it against the detector's detections on that same frame to
+    infer which COCO class it belongs to. `detector` must be a YOLO instance
+    that has never had .track() called on it before this - calling .track()
+    permanently attaches a tracking callback to a model that then filters all
+    later results (even from .predict()) down to already-activated ByteTrack
+    tracks, hiding any object outside the class currently being tracked.
+    persist=False here so every call is a fresh single-frame tracking session
+    (frame_id resets to 1), which ByteTrack always activates immediately.
+    Returns the matched class id, or None if nothing was selected or matched
+    closely enough."""
+    window = "Drag a box around the object to track, then press ENTER (c to cancel)"
+    rx, ry, rw, rh = cv2.selectROI(window, frame, showCrosshair=True)
+    cv2.destroyWindow(window)
+    if rw == 0 or rh == 0:
+        return None
+    roi_box = (rx, ry, rx + rw, ry + rh)
+
+    results = detector.track(frame, persist=False, tracker="bytetrack.yaml", conf=conf, device=device, verbose=False)
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        print(f"Detector found no objects at all at conf>={conf} (try lowering --conf).")
+        return None
+    xyxy = boxes.xyxy.cpu().numpy()
+    class_ids = boxes.cls.int().cpu().numpy()
+
+    best_iou, best_class = 0.0, None
+    for box, class_id in zip(xyxy, class_ids):
+        score = iou(roi_box, box)
+        if score > best_iou:
+            best_iou, best_class = score, int(class_id)
+
+    if best_class is None or best_iou < 0.1:
+        names = [detector.names[int(c)] for c in class_ids]
+        print(f"Found {len(class_ids)} object(s) ({names}) but none overlapped the box (best IoU={best_iou:.2f}).")
+        return None
+    return best_class
+
+
 def select_target(detections, locked_id, frame_center):
     """Sticks to the currently locked track ID if it's still detected;
     otherwise (re-)locks onto whichever detection is closest to the frame
@@ -187,10 +238,15 @@ def main():
     parser.add_argument("--saturation", type=int, choices=range(-2, 3), help="Color saturation, -2 to 2")
     parser.add_argument("--contrast", type=int, choices=range(-2, 3), help="Contrast, -2 to 2")
     parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics model weights (default yolov8n.pt)")
-    parser.add_argument("--class-id", type=int, default=0, help="COCO class id to track (default 0 = person)")
-    parser.add_argument("--conf", type=float, default=0.4, help="Detection confidence threshold (default 0.4)")
+    parser.add_argument("--class-id", type=int, default=75, help="COCO class id to track (default 0 = person)")
+    parser.add_argument("--conf", type=float, default=0.2, help="Detection confidence threshold (default 0.2)")
     parser.add_argument("--device", help="Inference device, e.g. mps/cuda/cpu (default: auto-detect)")
     parser.add_argument("--list-classes", action="store_true", help="Print COCO class id -> name and exit")
+    parser.add_argument(
+        "--select-roi",
+        action="store_true",
+        help="Drag a box around the object to track on the first frame instead of passing --class-id",
+    )
     args = parser.parse_args()
 
     if args.list_classes:
@@ -219,6 +275,11 @@ def main():
     device = pick_device(args.device)
     print(f"Loading {args.model} on device={device} ...")
     model = YOLO(args.model)
+    # Separate instance for ROI class-picking: model.track() permanently attaches a
+    # tracking callback to whichever model it's called on, which then keeps filtering
+    # results down to activated tracks even on later plain .predict() calls. A model
+    # that never has .track() called on it stays a clean, stateless detector.
+    detector = YOLO(args.model)
 
     window = "ESP32-CAM Object Tracker"
     locked_id = None
@@ -228,6 +289,14 @@ def main():
     print("Waiting for first frame...")
     while reader.read() is None:
         time.sleep(0.05)
+
+    if args.select_roi:
+        class_id = select_target_class(detector, reader.read(), args.conf, device)
+        if class_id is None:
+            print("No object detected in the selected box; falling back to --class-id.")
+        else:
+            args.class_id = class_id
+            print(f"Tracking class {args.class_id} ({model.names[args.class_id]}); acquiring nearest match...")
 
     while True:
         frame = reader.read()
@@ -259,7 +328,12 @@ def main():
         if key == ord("q"):
             break
         elif key == ord("r"):
-            locked_id = None
+            class_id = select_target_class(detector, frame, args.conf, device)
+            if class_id is None:
+                print("No object detected in the selected box; keeping current target.")
+            else:
+                args.class_id, locked_id = class_id, None
+                print(f"Tracking class {args.class_id} ({model.names[args.class_id]}); re-acquiring nearest match...")
 
     reader.stop()
     cv2.destroyAllWindows()
