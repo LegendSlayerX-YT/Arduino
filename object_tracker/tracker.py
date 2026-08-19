@@ -1,24 +1,27 @@
 """
 Live object tracker for an ESP32-CAM running the CameraWebServer sketch.
 
-Connects to the board's MJPEG stream (served on port 81 at /stream), lets you
-draw a box around anything in the video, and tracks it frame-to-frame with
-OpenCV while overlaying a bounding box, center marker, and pixel offset from
-frame center.
+Connects to the board's MJPEG stream (served on port 81 at /stream) and runs
+YOLOv8 object detection + ByteTrack on every frame to follow a target class
+(person, by default). Unlike a classic single-object CV tracker (CSRT etc.),
+the detector re-finds the target from scratch each frame, so there's no
+drift, no manual re-selection after occlusion, and no need for a hand-picked
+ROI - it just keeps detecting.
 
-If the tracked object leaves the frame (or the tracker otherwise loses it),
-the tracker doesn't just give up: it remembers the object's appearance (ORB
-features + a color histogram, captured when you selected it) and keeps
-scanning each incoming frame for a confident match. As soon as the object
-reappears anywhere in view, tracking resumes automatically - no need to
-press 'r' again.
+When multiple instances of the target class are in view, the tracker sticks
+to whichever ByteTrack ID it last locked onto (so it doesn't hop between
+people frame to frame). If that ID disappears, it re-locks onto whichever
+detection is currently closest to the frame center.
 
 Usage:
     python tracker.py --host 192.168.1.50
     (find the IP from the ESP32's serial monitor output on boot)
 
+    python tracker.py --host 192.168.1.50 --class-id 32   # track a sports ball instead
+    python tracker.py --list-classes                       # print COCO class id -> name
+
 Controls:
-    r - select (or reselect) the object to track
+    r - clear the current lock (re-acquire nearest-to-center target)
     q - quit
 
 If the feed is too dark, try (AI-Thinker board has an onboard flash LED):
@@ -36,6 +39,8 @@ import time
 import cv2
 import numpy as np
 import requests
+import torch
+from ultralytics import YOLO
 
 
 def frame_generator(stream_url, timeout=10):
@@ -62,9 +67,8 @@ def frame_generator(stream_url, timeout=10):
 
 class StreamReader:
     """Continuously drains the MJPEG stream on a background thread so a
-    blocking UI call on the main thread (e.g. ROI selection) never stalls
-    the network read and breaks the connection. Reconnects automatically
-    on transient errors."""
+    blocking UI call on the main thread never stalls the network read and
+    breaks the connection. Reconnects automatically on transient errors."""
 
     def __init__(self, stream_url):
         self.stream_url = stream_url
@@ -105,206 +109,53 @@ def set_control(host, var, val):
         print(f"Warning: failed to set {var}={val} ({exc})")
 
 
-def create_tracker():
-    if hasattr(cv2, "TrackerCSRT_create"):
-        return cv2.TrackerCSRT_create()
-    return cv2.legacy.TrackerCSRT_create()
+def pick_device(requested):
+    if requested is not None:
+        return requested
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
-# Re-detection tuning: how many good ORB matches (after Lowe's ratio test)
-# are needed before a candidate region is trusted, and how well its color
-# histogram must correlate with the original selection's.
-ORB_FEATURES = 500
-MIN_GOOD_MATCHES = 10
-MIN_INLIER_MATCHES = 8
-LOWE_RATIO = 0.75
-HIST_CORR_THRESHOLD = 0.5
-# While CSRT is actively tracking, its bbox is checked against the stored
-# histogram each frame. This is more lenient than HIST_CORR_THRESHOLD since
-# minor motion blur/lighting shifts shouldn't be treated as a lost object,
-# but it still catches CSRT locking onto background after the object left.
-TRACK_VERIFY_HIST_THRESHOLD = 0.35
-# Consecutive failed appearance checks allowed before a CSRT-reported box is
-# actually discarded. A single bad frame is normal when the object is only
-# partially out of view (a smaller/edge-clipped crop naturally correlates
-# worse) - only a sustained mismatch means CSRT has locked onto background.
-TRACK_LOSS_GRACE_FRAMES = 5
-# Fallback re-detection by color alone (used when the object doesn't have
-# enough distinctive texture for ORB matching to reliably reacquire it).
-COLOR_BACKPROJ_THRESHOLD = 50
-MIN_COLOR_BLOB_AREA_RATIO = 0.15
+def parse_detections(results):
+    """Extracts (box, track_id) pairs from a single model.track() result.
+    Detections without a track ID (tracker hasn't confirmed them yet) are
+    dropped since locking relies on stable IDs."""
+    boxes = results[0].boxes
+    if boxes is None or boxes.id is None:
+        return []
+    xyxy = boxes.xyxy.cpu().numpy()
+    ids = boxes.id.int().cpu().numpy()
+    return list(zip(xyxy, ids))
 
 
-def compute_hsv_hist(frame, bbox):
-    x, y, w, h = [int(v) for v in bbox]
-    patch = frame[y : y + h, x : x + w]
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
-    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-    return hist
+def select_target(detections, locked_id, frame_center):
+    """Sticks to the currently locked track ID if it's still detected;
+    otherwise (re-)locks onto whichever detection is closest to the frame
+    center. Returns (box, track_id) or (None, None) if nothing is detected."""
+    if locked_id is not None:
+        for box, track_id in detections:
+            if track_id == locked_id:
+                return box, track_id
+
+    if not detections:
+        return None, None
+
+    def dist_to_center(item):
+        x1, y1, x2, y2 = item[0]
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        return (cx - frame_center[0]) ** 2 + (cy - frame_center[1]) ** 2
+
+    box, track_id = min(detections, key=dist_to_center)
+    return box, track_id
 
 
-def compute_signature(orb, frame, bbox):
-    """Captures what the selected object looks like, so it can be found
-    again later even after leaving the frame entirely. Keypoints are kept
-    in patch-local coordinates so a homography can later map them onto
-    wherever the object reappears in the full frame."""
-    x, y, w, h = [int(v) for v in bbox]
-    patch_gray = cv2.cvtColor(frame[y : y + h, x : x + w], cv2.COLOR_BGR2GRAY)
-    keypoints, descriptors = orb.detectAndCompute(patch_gray, None)
-    return {
-        "keypoints": keypoints,
-        "descriptors": descriptors,
-        "hist": compute_hsv_hist(frame, bbox),
-        "size": (w, h),
-    }
-
-
-def _find_object_by_features(orb, matcher, frame, signature):
-    """Scans the full frame for the object using RANSAC-filtered ORB feature
-    matches to compute a homography from the original patch to its new
-    location. This rejects outlier/spurious matches instead of letting them
-    skew a naive bounding box, giving a precise bbox - but it needs the
-    object to have enough distinctive texture to match on."""
-    keypoints, descriptors = signature["keypoints"], signature["descriptors"]
-    if descriptors is None or len(descriptors) < 4:
-        return None
-
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    frame_kp, frame_desc = orb.detectAndCompute(gray, None)
-    if frame_desc is None or len(frame_kp) < 2:
-        return None
-
-    matches = matcher.knnMatch(descriptors, frame_desc, k=2)
-    good = [m for m, n in ((p[0], p[1]) for p in matches if len(p) == 2) if m.distance < LOWE_RATIO * n.distance]
-    if len(good) < MIN_GOOD_MATCHES:
-        return None
-
-    src_pts = np.float32([keypoints[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([frame_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    homography, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    if homography is None or inlier_mask is None or int(inlier_mask.sum()) < MIN_INLIER_MATCHES:
-        return None
-
-    ref_w, ref_h = signature["size"]
-    corners = np.float32([[0, 0], [0, ref_h], [ref_w, ref_h], [ref_w, 0]]).reshape(-1, 1, 2)
-    projected = cv2.perspectiveTransform(corners, homography)
-    x, y, w, h = cv2.boundingRect(projected)
-
-    # A poorly-conditioned homography (few/clustered inlier matches) can
-    # still pass the checks above while producing a plausible-but-wrong box
-    # size (e.g. half the object). The camera position is fixed, so the
-    # object's apparent size shouldn't swing far from its original scale.
-    if w < ref_w * 0.6 or h < ref_h * 0.6 or w > ref_w * 1.8 or h > ref_h * 1.8:
-        return None
-
-    return _clip_and_verify(frame, (x, y, w, h), signature)
-
-
-def _find_object_by_color(frame, signature):
-    """Fallback re-detection using only the stored color histogram, via
-    backprojection. Doesn't need any texture on the object, so it catches
-    cases (plain-colored objects) where ORB feature matching can't find
-    enough keypoints to reacquire the object."""
-    ref_w, ref_h = signature["size"]
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # signature["hist"] is normalized to 0-1 (for compareHist elsewhere), but
-    # calcBackProject uses histogram values directly as pixel weights, so it
-    # needs its own copy rescaled to 0-255 or COLOR_BACKPROJ_THRESHOLD would
-    # never be reachable.
-    backproj_hist = cv2.normalize(signature["hist"], None, 0, 255, cv2.NORM_MINMAX)
-    backproj = cv2.calcBackProject([hsv], [0, 1], backproj_hist, [0, 180, 0, 256], 1)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    _, mask = cv2.threshold(backproj, COLOR_BACKPROJ_THRESHOLD, 255, cv2.THRESH_BINARY)
-    # A single-colored object (e.g. a glossy box) often gets split into
-    # several blobs by a highlight or shadow on part of its surface. Close
-    # first to bridge those internal gaps back into one blob, then open to
-    # drop small unrelated noise specks elsewhere in the frame.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.dilate(mask, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    # Even after closing, a stubborn highlight can leave the object as a
-    # couple of separate-but-adjacent blobs. Merge every blob near the
-    # largest one (rather than keeping only the single biggest) so the
-    # reacquired box covers the whole object instead of one fragment.
-    noise_area = ref_w * ref_h * 0.03
-    significant = [c for c in contours if cv2.contourArea(c) >= noise_area]
-    if not significant:
-        return None
-
-    primary = max(significant, key=cv2.contourArea)
-    px, py, pw, ph = cv2.boundingRect(primary)
-    margin = max(ref_w, ref_h) * 0.5
-    region_x0, region_y0 = px - margin, py - margin
-    region_x1, region_y1 = px + pw + margin, py + ph + margin
-
-    def near_primary(contour):
-        cx, cy, cw, ch = cv2.boundingRect(contour)
-        return not (cx + cw < region_x0 or cx > region_x1 or cy + ch < region_y0 or cy > region_y1)
-
-    merged_points = np.vstack([c for c in significant if near_primary(c)])
-    x, y, w, h = cv2.boundingRect(merged_points)
-    if w * h < ref_w * ref_h * MIN_COLOR_BLOB_AREA_RATIO:
-        return None
-
-    return _clip_and_verify(frame, (x, y, w, h), signature)
-
-
-def _clip_and_verify(frame, bbox, signature):
-    """Clips bbox to the frame and confirms its color histogram still
-    resembles the stored signature, to reject false-positive candidates."""
-    frame_h, frame_w = frame.shape[:2]
-    x, y, w, h = bbox
-    x, y = max(0, int(x)), max(0, int(y))
-    w, h = min(int(w), frame_w - x), min(int(h), frame_h - y)
-    if w <= 0 or h <= 0:
-        return None
-
-    candidate_hist = compute_hsv_hist(frame, (x, y, w, h))
-    correlation = cv2.compareHist(signature["hist"], candidate_hist, cv2.HISTCMP_CORREL)
-    if correlation < HIST_CORR_THRESHOLD:
-        return None
-
-    return (x, y, w, h)
-
-
-def find_object(orb, matcher, frame, signature):
-    """Scans the full frame for the object described by signature. Tries
-    precise feature-based localization first, falling back to color-blob
-    detection when the object lacks enough texture to match on."""
-    candidate = _find_object_by_features(orb, matcher, frame, signature)
-    if candidate is not None:
-        return candidate
-    return _find_object_by_color(frame, signature)
-
-
-def verify_tracking(frame, bbox, signature):
-    """Sanity-checks that a CSRT-reported bbox still looks like the tracked
-    object. CSRT's update() can keep returning success even after the
-    object has left the frame, by locking onto whatever background is left
-    under the last-known box - this catches that case."""
-    frame_h, frame_w = frame.shape[:2]
-    x, y, w, h = [int(v) for v in bbox]
-    x, y = max(0, x), max(0, y)
-    w, h = min(w, frame_w - x), min(h, frame_h - y)
-    if w <= 0 or h <= 0:
-        return False
-    candidate_hist = compute_hsv_hist(frame, (x, y, w, h))
-    correlation = cv2.compareHist(signature["hist"], candidate_hist, cv2.HISTCMP_CORREL)
-    return correlation >= TRACK_VERIFY_HIST_THRESHOLD
-
-
-def draw_overlay(frame, bbox):
-    x, y, w, h = [int(v) for v in bbox]
-    cx, cy = x + w // 2, y + h // 2
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+def draw_overlay(frame, box, track_id):
+    x1, y1, x2, y2 = [int(v) for v in box]
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
     cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
     cv2.line(frame, (cx - 15, cy), (cx + 15, cy), (0, 255, 255), 1)
     cv2.line(frame, (cx, cy - 15), (cx, cy + 15), (0, 255, 255), 1)
@@ -313,11 +164,11 @@ def draw_overlay(frame, bbox):
     offset_x, offset_y = cx - frame_w // 2, cy - frame_h // 2
     cv2.putText(
         frame,
-        f"dx={offset_x} dy={offset_y}",
-        (10, 25),
+        f"ID:{track_id} dx={offset_x} dy={offset_y}",
+        (x1, max(y1 - 10, 15)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
-        (0, 255, 255),
+        (0, 255, 0),
         2,
     )
 
@@ -327,15 +178,29 @@ def draw_status(frame, text, color=(0, 255, 255)):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ESP32-CAM live object tracker")
-    parser.add_argument("--host", required=True, help="ESP32-CAM IP address, e.g. 192.168.1.50")
+    parser = argparse.ArgumentParser(description="ESP32-CAM live object tracker (YOLOv8 + ByteTrack)")
+    parser.add_argument("--host", help="ESP32-CAM IP address, e.g. 192.168.1.50")
     parser.add_argument("--port", type=int, default=81, help="Stream server port (default 81)")
     parser.add_argument("--led", type=int, help="Onboard flash LED intensity, 0-255 (AI-Thinker board only)")
     parser.add_argument("--ae-level", type=int, choices=range(-2, 3), help="Auto exposure target level, -2 to 2")
     parser.add_argument("--brightness", type=int, choices=range(-2, 3), help="Brightness offset, -2 to 2")
     parser.add_argument("--saturation", type=int, choices=range(-2, 3), help="Color saturation, -2 to 2")
     parser.add_argument("--contrast", type=int, choices=range(-2, 3), help="Contrast, -2 to 2")
+    parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics model weights (default yolov8n.pt)")
+    parser.add_argument("--class-id", type=int, default=0, help="COCO class id to track (default 0 = person)")
+    parser.add_argument("--conf", type=float, default=0.4, help="Detection confidence threshold (default 0.4)")
+    parser.add_argument("--device", help="Inference device, e.g. mps/cuda/cpu (default: auto-detect)")
+    parser.add_argument("--list-classes", action="store_true", help="Print COCO class id -> name and exit")
     args = parser.parse_args()
+
+    if args.list_classes:
+        model = YOLO(args.model)
+        for class_id, name in sorted(model.names.items()):
+            print(f"{class_id}: {name}")
+        return
+
+    if not args.host:
+        parser.error("--host is required")
 
     if args.led is not None:
         set_control(args.host, "led_intensity", args.led)
@@ -351,12 +216,12 @@ def main():
     stream_url = f"http://{args.host}:{args.port}/stream"
     print(f"Connecting to {stream_url} ...")
 
+    device = pick_device(args.device)
+    print(f"Loading {args.model} on device={device} ...")
+    model = YOLO(args.model)
+
     window = "ESP32-CAM Object Tracker"
-    tracker = None
-    signature = None
-    lost_streak = 0
-    orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+    locked_id = None
 
     reader = StreamReader(stream_url).start()
 
@@ -369,30 +234,24 @@ def main():
         if frame is None:
             continue
 
-        if tracker is not None:
-            ok, bbox = tracker.update(frame)
-            if ok and verify_tracking(frame, bbox, signature):
-                lost_streak = 0
-                draw_overlay(frame, bbox)
-            elif ok and lost_streak < TRACK_LOSS_GRACE_FRAMES:
-                # Appearance check failed but CSRT still thinks it has the
-                # object - likely a partial exit/occlusion. Keep the box up
-                # for a few frames rather than dropping it on one bad frame.
-                lost_streak += 1
-                draw_overlay(frame, bbox)
-            else:
-                tracker = None
-                lost_streak = 0
-        elif signature is not None:
-            candidate = find_object(orb, matcher, frame, signature)
-            if candidate is not None:
-                tracker = create_tracker()
-                tracker.init(frame, candidate)
-                draw_overlay(frame, candidate)
-            else:
-                draw_status(frame, "Object out of view - searching...", (0, 165, 255))
+        frame_h, frame_w = frame.shape[:2]
+        results = model.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            classes=[args.class_id],
+            conf=args.conf,
+            device=device,
+            verbose=False,
+        )
+        detections = parse_detections(results)
+        box, track_id = select_target(detections, locked_id, (frame_w / 2, frame_h / 2))
+        locked_id = track_id
+
+        if box is not None:
+            draw_overlay(frame, box, track_id)
         else:
-            draw_status(frame, "Press 'r' to select an object to track")
+            draw_status(frame, "TARGET LOST - searching...", (0, 0, 255))
 
         cv2.imshow(window, frame)
         key = cv2.waitKey(1) & 0xFF
@@ -400,15 +259,7 @@ def main():
         if key == ord("q"):
             break
         elif key == ord("r"):
-            lost_streak = 0
-            roi = cv2.selectROI(window, frame, fromCenter=False, showCrosshair=True)
-            if roi[2] > 0 and roi[3] > 0:
-                tracker = create_tracker()
-                tracker.init(frame, roi)
-                signature = compute_signature(orb, frame, roi)
-            else:
-                tracker = None
-                signature = None
+            locked_id = None
 
     reader.stop()
     cv2.destroyAllWindows()
