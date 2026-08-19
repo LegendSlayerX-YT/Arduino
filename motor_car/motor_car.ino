@@ -20,6 +20,41 @@ SpeedControl motor_control(
 
 Speed speed(0,0,0,0);
 
+const unsigned long MOVE_TIMEOUT_MS = 300;
+unsigned long move_deadline = 0;
+bool moving = false;
+
+void start_move(const Speed& new_speed) {
+  speed = new_speed;
+  move_deadline = millis() + MOVE_TIMEOUT_MS;
+  moving = true;
+}
+
+void stop_move() {
+  speed = Speed(0,0,0,0);
+  moving = false;
+}
+
+float parse_query_param(const String& data, const String& key) {
+  String search = key + "=";
+  int valueStart = data.indexOf(search);
+  if (valueStart < 0) {
+    return 0;
+  }
+  valueStart += search.length();
+  int valueEnd = data.indexOf('&', valueStart);
+  if (valueEnd < 0) {
+    valueEnd = data.length();
+  }
+  return data.substring(valueStart, valueEnd).toFloat();
+}
+
+float clamp(float value, float low, float high) {
+  if (value < low) return low;
+  if (value > high) return high;
+  return value;
+}
+
 void setup() {
   Serial.begin(9600);           
   Serial.println("Basic Motor Test!");
@@ -31,7 +66,10 @@ void setup() {
 
 void loop() {
 
-  Serial.println("Loop");
+  if (moving && millis() >= move_deadline) {
+    stop_move();
+    motor_control.apply_speed(speed);
+  }
 
   Request request = wifi.get_request();
   if (request.code != -1) {
@@ -41,24 +79,33 @@ void loop() {
 
 
     if (request.code == 200 && request.data == "/up") {
-      speed = speed + FORWARD_MOVE * 0.3;
+      start_move(speed + FORWARD_MOVE * 0.3);
     }
     else if (request.code == 200 && request.data == "/down") {
-      speed = speed - FORWARD_MOVE * 0.3;
+      start_move(speed - FORWARD_MOVE * 0.3);
     }
     else if (request.code == 200 && request.data == "/left") {
-      speed = speed + ROTATE_LEFT * 0.15;
+      start_move(speed + ROTATE_LEFT * 0.15);
     }
     else if (request.code == 200 && request.data == "/right") {
-      speed = speed - ROTATE_LEFT * 0.15;
+      start_move(speed - ROTATE_LEFT * 0.15);
     }
     else if (request.code == 200 && request.data == "/stop") {
-      speed = Speed(0,0,0,0);
+      stop_move();
+    }
+    else if (request.code == 200 && request.data.startsWith("/move")) {
+      float forward = clamp(parse_query_param(request.data, "forward"), -1, 1);
+      float left = clamp(parse_query_param(request.data, "left"), -1, 1);
+      if (forward == 0 && left == 0) {
+        stop_move();
+      } else {
+        start_move(FORWARD_MOVE * forward + ROTATE_LEFT * left);
+      }
     }
 
     wifi.send_response(String("Hello Chen") +request.data + String(" -- ")+ speed[0]);
     motor_control.apply_speed(speed);
   }
 
-  delay(1000);  
+  delay(20);
 }

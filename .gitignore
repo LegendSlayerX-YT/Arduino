@@ -1,3 +1,4 @@
 libraries/*
 .vscode
 .DS_Store
+object_tracker/venv
