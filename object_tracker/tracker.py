@@ -36,6 +36,7 @@ For more vivid color:
 import argparse
 import threading
 import time
+import zlib
 
 import cv2
 import numpy as np
@@ -321,6 +322,11 @@ def main():
             draw_overlay(frame, box, track_id)
         else:
             draw_status(frame, "TARGET LOST - searching...", (0, 0, 255))
+
+        now = time.time()
+        timestamp = f"{time.strftime('%H:%M:%S', time.localtime(now))}.{int(now % 1 * 1000):03d}"
+        frame_hash = f"{zlib.crc32(frame.tobytes()):08x}"
+        print(f"[{timestamp}] hash={frame_hash} box={'none' if box is None else box}")
 
         cv2.imshow(window, frame)
         key = cv2.waitKey(1) & 0xFF
