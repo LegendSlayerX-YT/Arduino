@@ -2,3 +2,4 @@ libraries/*
 .vscode
 .DS_Store
 object_tracker/venv
+__pycache__
