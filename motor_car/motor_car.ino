@@ -44,6 +44,9 @@ void stop_move() {
 float parse_query_param(const String& data, const String& key) {
   String search = key + "=";
   int valueStart = data.indexOf(search);
+  while (valueStart > 0 && data[valueStart - 1] != '?' && data[valueStart - 1] != '&') {
+    valueStart = data.indexOf(search, valueStart + 1);
+  }
   if (valueStart < 0) {
     return 0;
   }
@@ -112,14 +115,15 @@ void loop() {
     else if (request.code == 200 && request.data.startsWith("/move")) {
       float forward = clamp(parse_query_param(request.data, "forward"), -1, 1);
       float left = clamp(parse_query_param(request.data, "left"), -1, 1);
-      if (forward == 0 && left == 0) {
+      float shift_left = clamp(parse_query_param(request.data, "shift_left"), -1, 1);
+      if (forward == 0 && left == 0 && shift_left == 0) {
         stop_move();
       } else {
-        start_move(FORWARD_MOVE * forward + ROTATE_LEFT * left);
+        start_move(FORWARD_MOVE * forward + ROTATE_LEFT * left + SHIFT_LEFT * shift_left);
       }
     }
 
-    wifi.send_response(String("Hello Chen") +request.data + String(" -- ")+ speed[0]);
+    wifi.send_response(String("Hello Chen") +request.data + String(" -- ")+ speed[0] + String(", ") + speed[1] + String(", ")+ speed[2] + String(", ")+ speed[3] + String(", "));
     motor_control.apply_speed(speed);
   }
 

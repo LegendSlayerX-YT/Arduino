@@ -3,31 +3,46 @@ Live object tracker for an ESP32-CAM running the CameraWebServer sketch,
 with optional closed-loop driving of the motor car (see motor_car/motor_car.ino)
 to keep the tracked object centered in frame.
 
-Connects to the camera board's MJPEG stream (served on port 81 at /stream),
-lets you draw a box around anything in the video, and tracks it frame-to-frame
-with OpenCV while overlaying a bounding box, center marker, and pixel offset
-from frame center. When --car-host is given, it also drives the car via the
-motor board's /move?forward=&left= endpoint to keep the object centered
-(rotating in place to correct left/right offset, and optionally driving
-forward/back to hold the object's on-screen size).
+Connects to the camera board's MJPEG stream (served on port 81 at /stream)
+and runs YOLOv8 object detection + ByteTrack on every frame (mirroring
+object_tracker/tracker.py) instead of a classic single-object CV tracker.
+The detector re-finds objects from scratch each frame, so there's no drift
+and no manual ROI to draw.
 
-If the tracked object leaves the frame (or the tracker otherwise loses it),
-the tracker doesn't just give up: it remembers the object's appearance (ORB
-features + a color histogram, captured when you selected it) and keeps
-scanning each incoming frame for a confident match. As soon as the object
-reappears anywhere in view, tracking (and driving) resumes automatically -
-no need to press 'r' again.
+Selection logic: at startup no object class is fixed, so nothing is
+detected or tracked yet. Press 'r' to drag a box around the object you
+want; a one-off, class-unfiltered detection pass matches (by IoU) whatever
+overlaps that box to figure out its COCO class, and detection is then
+narrowed to just that class from then on (e.g. selecting a person
+restricts every later frame to detecting people). Once a class is set, if
+nothing is locked yet the tracker locks onto whichever detection of that
+class currently has the largest bounding-box area; once locked, it sticks
+to that ByteTrack ID frame to frame (so it doesn't hop between objects)
+until that ID disappears, at which point it falls back to re-locking onto
+the current biggest detection of the same class. Press 'r' again at any
+time to pick a different object (and class) to track.
+
+When --car-host is given, it also drives the car via the motor board's
+/move?forward=&left= endpoint to keep the locked object centered (rotating
+in place to correct left/right offset, and optionally driving forward/back
+to hold the object's on-screen size).
 
 Usage:
     python car_controller.py --host 192.168.1.50
     (find the camera's IP from the ESP32's serial monitor output on boot)
 
     python car_controller.py --host 192.168.1.50 --car-host 192.168.1.60
-    (also drive the car to keep the selected object centered)
+    (also drive the car to keep the locked object centered)
+
+    python car_controller.py --host 192.168.1.50 --classes 0
+    (skip the 'r' selection step and start tracking COCO class 0 (person)
+    directly; pressing 'r' still lets you switch to a different object/class)
 
 Controls:
-    r - select (or reselect) the object to track (re-enables driving)
-    c - toggle auto-drive on/off without losing the tracked object
+    r - drag a box around the object to track; a one-off detection pass
+        figures out its class, and tracking narrows to that class from then
+        on. Cancel with ENTER/c on an empty box to keep the current target.
+    c - toggle auto-drive on/off without dropping the lock
     s - emergency stop (halts the car, keeps tracking)
     q - quit (stops the car first)
 
@@ -46,6 +61,8 @@ import time
 import cv2
 import numpy as np
 import requests
+import torch
+from ultralytics import YOLO
 
 
 def frame_generator(stream_url, timeout=10):
@@ -72,9 +89,8 @@ def frame_generator(stream_url, timeout=10):
 
 class StreamReader:
     """Continuously drains the MJPEG stream on a background thread so a
-    blocking UI call on the main thread (e.g. ROI selection) never stalls
-    the network read and breaks the connection. Reconnects automatically
-    on transient errors."""
+    blocking UI call on the main thread never stalls the network read and
+    breaks the connection. Reconnects automatically on transient errors."""
 
     def __init__(self, stream_url):
         self.stream_url = stream_url
@@ -138,8 +154,8 @@ class CarController:
         self.base_url = f"http://{host}:{port}"
         self.send_interval = send_interval
         self.timeout = timeout
-        self._target = (0.0, 0.0)
-        self._sent = (None, None)
+        self._target = (0.0, 0.0, 0.0)
+        self._sent = (None, None, None)
         self._lock = threading.Lock()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -148,24 +164,27 @@ class CarController:
         self._thread.start()
         return self
 
-    def set_target(self, forward, left):
+    def set_target(self, forward, left, shift_left):
         with self._lock:
-            self._target = (forward, left)
+            self._target = (forward, left, shift_left)
 
     def stop_moving(self):
-        self.set_target(0.0, 0.0)
+        self.set_target(0.0, 0.0, 0.0)
 
     def _run(self):
         while self._running:
             with self._lock:
                 target = self._target
 
-            if target != (0.0, 0.0) or target != self._sent:
+            print(
+                f"Car command: forward={target[0]:+.2f} left={target[1]:+.2f} "
+                f"shift_left={target[2]:+.2f}"
+            )
+            if target != (0.0, 0.0, 0.0) or target != self._sent:
                 try:
-                    print(f"Car command: forward={target[0]:+.2f} left={target[1]:+.2f}")
                     requests.get(
                         f"{self.base_url}/move",
-                        params={"forward": target[0], "left": target[1]},
+                        params={"forward": target[0], "left": target[1], "shift_left": target[2]},
                         timeout=self.timeout,
                     )
                     self._sent = target
@@ -180,6 +199,8 @@ class CarController:
         self._running = False
         self._thread.join(timeout=1)
 
+def sign(x):
+    return 1 if x > 0 else -1 if x < 0 else 0
 
 def compute_drive_command(
     bbox,
@@ -188,15 +209,25 @@ def compute_drive_command(
     target_area_frac_upper,
     kp_forward,
     kp_left,
+    kp_shift,
     deadzone_x=0.08,
+    quarter_threshold=0.5,
     max_speed=0.4,
     max_left=0.2,
+    max_shift=0.2,
+    min_move=0.08,
 ):
     """Proportional controller that keeps a tracked bbox centered.
 
-    Horizontal offset drives rotation ("left"): the car rotates in place
-    toward the side the object drifted to, which pans the camera that way
-    and pulls the object back toward center.
+    Horizontal offset drives one of two corrections, never both at once:
+    when the object is out in the left or right quarter of the frame
+    (|dx_norm| > quarter_threshold, since dx_norm spans -1..1 across the
+    full width so each quarter is 0.5 wide), the car rotates in place
+    ("left") toward that side, which pans the camera that way and pulls the
+    object back toward center. Once the object is closer in (inside the two
+    middle quarters but still outside the dead zone), rotation overshoots
+    for how little correction is needed, so the car instead shifts
+    laterally ("shift_left") for finer, more precise centering.
 
     Bounding-box area, as a fraction of the frame area, drives forward/back:
     below target_area_frac_lower the object is too small/far, so the car
@@ -207,9 +238,14 @@ def compute_drive_command(
     entirely. This runs independently of horizontal centering, so the car
     keeps closing/holding distance even while dx is already zero.
 
-    Rotation only kicks in once the object drifts outside the horizontal
-    dead zone; within it, rotation is zero. Forward/back speed is capped at
-    max_speed and rotation ("left") is capped at max_left.
+    Horizontal correction only kicks in once the object drifts outside the
+    horizontal dead zone; within it, both left and shift_left are zero.
+    Forward/back speed is capped at max_speed, rotation ("left") at
+    max_left, and lateral shift ("shift_left") at max_shift.
+
+    Below min_move the motor can't overcome static friction, so it just
+    strains without actually moving the car; all axes are snapped to 0
+    below that magnitude so the motor stops trying.
     """
     frame_h, frame_w = frame_shape[:2]
     x, y, w, h = bbox
@@ -217,8 +253,12 @@ def compute_drive_command(
     dx_norm = (cx - frame_w / 2) / (frame_w / 2)
 
     left = 0.0
+    shift_left = 0.0
     if abs(dx_norm) > deadzone_x:
-        left = clamp(-kp_left * dx_norm, -max_left, max_left)
+        if abs(dx_norm) > quarter_threshold:
+            left = clamp(-kp_left * dx_norm, -max_left, max_left)
+        else:
+            shift_left = clamp(-kp_shift * dx_norm, -max_shift, max_shift)
 
     forward = 0.0
     real_frac = (w * h) / (frame_w * frame_h)
@@ -229,206 +269,121 @@ def compute_drive_command(
         error = (real_frac - target_area_frac_upper) / target_area_frac_upper
         forward = clamp(-kp_forward * error, -max_speed, 0.0)
 
-    return forward, left
+    if abs(forward) < min_move:
+        forward = 0.0
+    if abs(left) < min_move:
+        left = 0.0
+    if abs(shift_left) < min_move:
+        shift_left = 0.0
+
+    return forward, left, shift_left
 
 
-def create_tracker():
-    if hasattr(cv2, "TrackerCSRT_create"):
-        return cv2.TrackerCSRT_create()
-    return cv2.legacy.TrackerCSRT_create()
+def pick_device(requested):
+    if requested is not None:
+        return requested
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
-# Re-detection tuning: how many good ORB matches (after Lowe's ratio test)
-# are needed before a candidate region is trusted, and how well its color
-# histogram must correlate with the original selection's.
-ORB_FEATURES = 500
-MIN_GOOD_MATCHES = 10
-MIN_INLIER_MATCHES = 8
-LOWE_RATIO = 0.75
-HIST_CORR_THRESHOLD = 0.5
-# While CSRT is actively tracking, its bbox is checked against the stored
-# histogram each frame. This is more lenient than HIST_CORR_THRESHOLD since
-# minor motion blur/lighting shifts shouldn't be treated as a lost object,
-# but it still catches CSRT locking onto background after the object left.
-TRACK_VERIFY_HIST_THRESHOLD = 0.35
-# Consecutive failed appearance checks allowed before a CSRT-reported box is
-# actually discarded. A single bad frame is normal when the object is only
-# partially out of view (a smaller/edge-clipped crop naturally correlates
-# worse) - only a sustained mismatch means CSRT has locked onto background.
-TRACK_LOSS_GRACE_FRAMES = 5
-# Fallback re-detection by color alone (used when the object doesn't have
-# enough distinctive texture for ORB matching to reliably reacquire it).
-COLOR_BACKPROJ_THRESHOLD = 50
-MIN_COLOR_BLOB_AREA_RATIO = 0.15
+def parse_detections(results):
+    """Extracts (box, track_id, class_id) triples from a single
+    model.track() result. Detections without a track ID (tracker hasn't
+    confirmed them yet) are dropped since locking relies on stable IDs."""
+    boxes = results[0].boxes
+    if boxes is None or boxes.id is None:
+        return []
+    xyxy = boxes.xyxy.cpu().numpy()
+    ids = boxes.id.int().cpu().numpy()
+    classes = boxes.cls.int().cpu().numpy()
+    return list(zip(xyxy, ids, classes))
 
 
-def compute_hsv_hist(frame, bbox):
-    x, y, w, h = [int(v) for v in bbox]
-    patch = frame[y : y + h, x : x + w]
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
-    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-    return hist
+def box_area(box):
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
 
-def compute_signature(orb, frame, bbox):
-    """Captures what the selected object looks like, so it can be found
-    again later even after leaving the frame entirely. Keypoints are kept
-    in patch-local coordinates so a homography can later map them onto
-    wherever the object reappears in the full frame."""
-    x, y, w, h = [int(v) for v in bbox]
-    patch_gray = cv2.cvtColor(frame[y : y + h, x : x + w], cv2.COLOR_BGR2GRAY)
-    keypoints, descriptors = orb.detectAndCompute(patch_gray, None)
-    return {
-        "keypoints": keypoints,
-        "descriptors": descriptors,
-        "hist": compute_hsv_hist(frame, bbox),
-        "size": (w, h),
-    }
+def select_target(detections, locked_id):
+    """Sticks to the locked track ID if it's still detected; otherwise (re-)
+    locks onto whichever detection currently has the largest bounding-box
+    area. Returns (box, track_id) or (None, None) if nothing is detected."""
+    if locked_id is not None:
+        for box, track_id, _ in detections:
+            if track_id == locked_id:
+                return box, track_id
+
+    if not detections:
+        return None, None
+
+    box, track_id, _ = max(detections, key=lambda item: box_area(item[0]))
+    return box, track_id
 
 
-def _find_object_by_features(orb, matcher, frame, signature):
-    """Scans the full frame for the object using RANSAC-filtered ORB feature
-    matches to compute a homography from the original patch to its new
-    location. This rejects outlier/spurious matches instead of letting them
-    skew a naive bounding box, giving a precise bbox - but it needs the
-    object to have enough distinctive texture to match on."""
-    keypoints, descriptors = signature["keypoints"], signature["descriptors"]
-    if descriptors is None or len(descriptors) < 4:
+def iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def select_target_class(detector, frame, conf, device, min_iou=0.1):
+    """Lets the user drag a box around the object to track, then runs a
+    fresh, class-unfiltered detection pass on that same frame to figure out
+    which COCO class it belongs to - matching by IoU against the box's
+    position, since the continuously-tracked `detections` can't be used
+    here (before a class is selected, args.classes is empty, so nothing is
+    being detected yet to match against).
+
+    `detector` must be a separate YOLO instance from the one driving the
+    persistent tracking loop: calling .track() on a model permanently
+    attaches a tracking callback that keeps filtering later results down to
+    already-activated tracks, so running this unfiltered scan on the same
+    model would corrupt its persist=True tracking state.
+
+    Returns the matched class id, or None if nothing was selected or
+    nothing overlapped closely enough (in which case the current lock and
+    class filter should be left alone)."""
+    picker_window = "Drag a box around the object to track, then press ENTER (c to cancel)"
+    rx, ry, rw, rh = cv2.selectROI(picker_window, frame, fromCenter=False, showCrosshair=True)
+    cv2.destroyWindow(picker_window)
+    if rw == 0 or rh == 0:
         return None
+    roi_box = (rx, ry, rx + rw, ry + rh)
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    frame_kp, frame_desc = orb.detectAndCompute(gray, None)
-    if frame_desc is None or len(frame_kp) < 2:
+    results = detector.track(frame, persist=False, tracker="bytetrack.yaml", conf=conf, device=device, verbose=False)
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        print(f"Detector found no objects at all at conf>={conf} (try lowering --conf).")
         return None
+    xyxy = boxes.xyxy.cpu().numpy()
+    class_ids = boxes.cls.int().cpu().numpy()
 
-    matches = matcher.knnMatch(descriptors, frame_desc, k=2)
-    good = [m for m, n in ((p[0], p[1]) for p in matches if len(p) == 2) if m.distance < LOWE_RATIO * n.distance]
-    if len(good) < MIN_GOOD_MATCHES:
+    best_iou, best_class = 0.0, None
+    for box, class_id in zip(xyxy, class_ids):
+        score = iou(roi_box, box)
+        if score > best_iou:
+            best_iou, best_class = score, int(class_id)
+
+    if best_class is None or best_iou < min_iou:
+        names = sorted({detector.names[int(c)] for c in class_ids})
+        print(f"Found {len(class_ids)} object(s) ({names}) but none overlapped the box closely enough (best IoU={best_iou:.2f}).")
         return None
-
-    src_pts = np.float32([keypoints[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst_pts = np.float32([frame_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    homography, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    if homography is None or inlier_mask is None or int(inlier_mask.sum()) < MIN_INLIER_MATCHES:
-        return None
-
-    ref_w, ref_h = signature["size"]
-    corners = np.float32([[0, 0], [0, ref_h], [ref_w, ref_h], [ref_w, 0]]).reshape(-1, 1, 2)
-    projected = cv2.perspectiveTransform(corners, homography)
-    x, y, w, h = cv2.boundingRect(projected)
-
-    # A poorly-conditioned homography (few/clustered inlier matches) can
-    # still pass the checks above while producing a plausible-but-wrong box
-    # size (e.g. half the object). The camera position is fixed, so the
-    # object's apparent size shouldn't swing far from its original scale.
-    if w < ref_w * 0.6 or h < ref_h * 0.6 or w > ref_w * 1.8 or h > ref_h * 1.8:
-        return None
-
-    return _clip_and_verify(frame, (x, y, w, h), signature)
+    return best_class
 
 
-def _find_object_by_color(frame, signature):
-    """Fallback re-detection using only the stored color histogram, via
-    backprojection. Doesn't need any texture on the object, so it catches
-    cases (plain-colored objects) where ORB feature matching can't find
-    enough keypoints to reacquire the object."""
-    ref_w, ref_h = signature["size"]
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    # signature["hist"] is normalized to 0-1 (for compareHist elsewhere), but
-    # calcBackProject uses histogram values directly as pixel weights, so it
-    # needs its own copy rescaled to 0-255 or COLOR_BACKPROJ_THRESHOLD would
-    # never be reachable.
-    backproj_hist = cv2.normalize(signature["hist"], None, 0, 255, cv2.NORM_MINMAX)
-    backproj = cv2.calcBackProject([hsv], [0, 1], backproj_hist, [0, 180, 0, 256], 1)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    _, mask = cv2.threshold(backproj, COLOR_BACKPROJ_THRESHOLD, 255, cv2.THRESH_BINARY)
-    # A single-colored object (e.g. a glossy box) often gets split into
-    # several blobs by a highlight or shadow on part of its surface. Close
-    # first to bridge those internal gaps back into one blob, then open to
-    # drop small unrelated noise specks elsewhere in the frame.
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.dilate(mask, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    # Even after closing, a stubborn highlight can leave the object as a
-    # couple of separate-but-adjacent blobs. Merge every blob near the
-    # largest one (rather than keeping only the single biggest) so the
-    # reacquired box covers the whole object instead of one fragment.
-    noise_area = ref_w * ref_h * 0.03
-    significant = [c for c in contours if cv2.contourArea(c) >= noise_area]
-    if not significant:
-        return None
-
-    primary = max(significant, key=cv2.contourArea)
-    px, py, pw, ph = cv2.boundingRect(primary)
-    margin = max(ref_w, ref_h) * 0.5
-    region_x0, region_y0 = px - margin, py - margin
-    region_x1, region_y1 = px + pw + margin, py + ph + margin
-
-    def near_primary(contour):
-        cx, cy, cw, ch = cv2.boundingRect(contour)
-        return not (cx + cw < region_x0 or cx > region_x1 or cy + ch < region_y0 or cy > region_y1)
-
-    merged_points = np.vstack([c for c in significant if near_primary(c)])
-    x, y, w, h = cv2.boundingRect(merged_points)
-    if w * h < ref_w * ref_h * MIN_COLOR_BLOB_AREA_RATIO:
-        return None
-
-    return _clip_and_verify(frame, (x, y, w, h), signature)
+def xyxy_to_xywh(box):
+    x1, y1, x2, y2 = box
+    return (float(x1), float(y1), float(x2 - x1), float(y2 - y1))
 
 
-def _clip_and_verify(frame, bbox, signature):
-    """Clips bbox to the frame and confirms its color histogram still
-    resembles the stored signature, to reject false-positive candidates."""
-    frame_h, frame_w = frame.shape[:2]
-    x, y, w, h = bbox
-    x, y = max(0, int(x)), max(0, int(y))
-    w, h = min(int(w), frame_w - x), min(int(h), frame_h - y)
-    if w <= 0 or h <= 0:
-        return None
-
-    candidate_hist = compute_hsv_hist(frame, (x, y, w, h))
-    correlation = cv2.compareHist(signature["hist"], candidate_hist, cv2.HISTCMP_CORREL)
-    if correlation < HIST_CORR_THRESHOLD:
-        return None
-
-    return (x, y, w, h)
-
-
-def find_object(orb, matcher, frame, signature):
-    """Scans the full frame for the object described by signature. Tries
-    precise feature-based localization first, falling back to color-blob
-    detection when the object lacks enough texture to match on."""
-    candidate = _find_object_by_features(orb, matcher, frame, signature)
-    if candidate is not None:
-        return candidate
-    return _find_object_by_color(frame, signature)
-
-
-def verify_tracking(frame, bbox, signature):
-    """Sanity-checks that a CSRT-reported bbox still looks like the tracked
-    object. CSRT's update() can keep returning success even after the
-    object has left the frame, by locking onto whatever background is left
-    under the last-known box - this catches that case."""
-    frame_h, frame_w = frame.shape[:2]
-    x, y, w, h = [int(v) for v in bbox]
-    x, y = max(0, x), max(0, y)
-    w, h = min(w, frame_w - x), min(h, frame_h - y)
-    if w <= 0 or h <= 0:
-        return False
-    candidate_hist = compute_hsv_hist(frame, (x, y, w, h))
-    correlation = cv2.compareHist(signature["hist"], candidate_hist, cv2.HISTCMP_CORREL)
-    return correlation >= TRACK_VERIFY_HIST_THRESHOLD
-
-
-def draw_overlay(frame, bbox, drive_command=None):
+def draw_overlay(frame, bbox, track_id, drive_command=None):
     x, y, w, h = [int(v) for v in bbox]
     cx, cy = x + w // 2, y + h // 2
     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
@@ -440,7 +395,7 @@ def draw_overlay(frame, bbox, drive_command=None):
     offset_x, offset_y = cx - frame_w // 2, cy - frame_h // 2
     cv2.putText(
         frame,
-        f"dx={offset_x} dy={offset_y}",
+        f"ID:{track_id} dx={offset_x} dy={offset_y}",
         (10, 25),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
@@ -449,10 +404,10 @@ def draw_overlay(frame, bbox, drive_command=None):
     )
 
     if drive_command is not None:
-        forward, left = drive_command
+        forward, left, shift_left = drive_command
         cv2.putText(
             frame,
-            f"drive: forward={forward:+.2f} left={left:+.2f}",
+            f"drive: forward={forward:+.2f} left={left:+.2f} shift_left={shift_left:+.2f}",
             (10, 50),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -465,15 +420,13 @@ def draw_status(frame, text, color=(0, 255, 255)):
     cv2.putText(frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
-def apply_bbox(frame, bbox, args, car, driving_enabled):
+def apply_bbox(frame, bbox, track_id, args, car, driving_enabled):
     """Drives the car (if enabled) to keep bbox centered and draws the
-    overlay. Shared by every place a valid bbox can come from this frame:
-    normal CSRT tracking, a grace-period frame, or a freshly reacquired box
-    from find_object."""
+    overlay."""
     _, _, bw, bh = bbox
     frame_h, frame_w = frame.shape[:2]
     area_pct = 100 * (bw * bh) / (frame_w * frame_h)
-    print(f"Object area: {area_pct:.1f}% of frame")
+    print(f"Object area: {area_pct:.1f}% of frame (ID:{track_id})")
 
     drive_command = None
     if car is not None:
@@ -490,18 +443,22 @@ def apply_bbox(frame, bbox, args, car, driving_enabled):
                 area_upper,
                 args.kp_forward,
                 args.kp_left,
+                args.kp_shift,
                 args.deadzone_x,
+                args.quarter_threshold,
                 args.max_speed,
                 args.max_left,
+                args.max_shift,
+                args.min_move,
             )
             car.set_target(*drive_command)
         else:
             car.stop_moving()
-    draw_overlay(frame, bbox, drive_command)
+    draw_overlay(frame, bbox, track_id, drive_command)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ESP32-CAM live object tracker")
+    parser = argparse.ArgumentParser(description="ESP32-CAM live object tracker (YOLOv8 + ByteTrack)")
     parser.add_argument("--host", required=True, help="ESP32-CAM IP address, e.g. 192.168.1.50")
     parser.add_argument("--port", type=int, default=81, help="Stream server port (default 81)")
     parser.add_argument("--led", type=int, help="Onboard flash LED intensity, 0-255 (AI-Thinker board only)")
@@ -509,17 +466,47 @@ def main():
     parser.add_argument("--brightness", type=int, choices=range(-2, 3), help="Brightness offset, -2 to 2")
     parser.add_argument("--saturation", type=int, choices=range(-2, 3), help="Color saturation, -2 to 2")
     parser.add_argument("--contrast", type=int, choices=range(-2, 3), help="Contrast, -2 to 2")
+    parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics model weights (default yolov8n.pt)")
+    parser.add_argument(
+        "--classes",
+        type=int,
+        nargs="+",
+        default=[],
+        help="Start tracking these COCO class ids immediately, skipping the 'r' selection step "
+        "(default: none - nothing is detected until you press 'r'). Pressing 'r' overrides this "
+        "to whichever single class you select.",
+    )
+    parser.add_argument("--conf", type=float, default=0.2, help="Detection confidence threshold (default 0.2)")
+    parser.add_argument("--device", help="Inference device, e.g. mps/cuda/cpu (default: auto-detect)")
     parser.add_argument(
         "--car-host",
         help="Motor car IP address (the board running motor_car.ino). "
         "If given, the car auto-drives to keep the tracked object centered.",
     )
     parser.add_argument("--car-port", type=int, default=80, help="Motor car HTTP port (default 80)")
-    parser.add_argument("--kp-left", type=float, default=0.3, help="Proportional gain for left/right rotation correction")
+    parser.add_argument("--kp-left", type=float, default=0.15, help="Proportional gain for left/right rotation correction")
+    parser.add_argument("--kp-shift", type=float, default=0.6, help="Proportional gain for lateral shift correction")
     parser.add_argument("--kp-forward", type=float, default=0.6, help="Proportional gain for forward/back distance correction")
     parser.add_argument("--deadzone-x", type=float, default=0.15, help="Horizontal dead zone as a fraction of half frame width")
+    parser.add_argument(
+        "--quarter-threshold",
+        type=float,
+        default=0.5,
+        help="Horizontal offset (as a fraction of half frame width, 0-1) beyond which the object "
+        "is considered to be in the left/right quarter of the frame and the car rotates to "
+        "recenter it; below this (but still outside the dead zone) it shifts laterally instead "
+        "for finer correction (default 0.5)",
+    )
     parser.add_argument("--max-speed", type=float, default=0.4, help="Cap on forward/back drive magnitude, 0-1 (default 0.4)")
     parser.add_argument("--max-left", type=float, default=0.2, help="Cap on rotation (left/right) drive magnitude, 0-1 (default 0.2)")
+    parser.add_argument("--max-shift", type=float, default=0.2, help="Cap on lateral shift drive magnitude, 0-1 (default 0.2)")
+    parser.add_argument(
+        "--min-move",
+        type=float,
+        default=0.1,
+        help="Forward/left values below this magnitude are snapped to 0 (motor can't overcome "
+        "static friction below it, so it just strains without moving the car) (default 0.08)",
+    )
     parser.add_argument(
         "--target-area-frac-lower",
         type=float,
@@ -553,13 +540,16 @@ def main():
     stream_url = f"http://{args.host}:{args.port}/stream"
     print(f"Connecting to {stream_url} ...")
 
+    device = pick_device(args.device)
+    print(f"Loading {args.model} on device={device} ...")
+    model = YOLO(args.model)
+    # Separate instance for ROI class-picking (see select_target_class) so the
+    # persistent tracking loop's ByteTrack state on `model` isn't disturbed.
+    detector = YOLO(args.model)
+
     window = "ESP32-CAM Object Tracker"
-    tracker = None
-    signature = None
-    lost_streak = 0
+    locked_id = None
     driving_enabled = True
-    orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
 
     car = None
     if args.car_host:
@@ -580,37 +570,29 @@ def main():
             if frame is None:
                 continue
 
-            if tracker is not None:
-                ok, bbox = tracker.update(frame)
-                if ok and verify_tracking(frame, bbox, signature):
-                    lost_streak = 0
-                    apply_bbox(frame, bbox, args, car, driving_enabled)
-                elif ok and lost_streak < TRACK_LOSS_GRACE_FRAMES:
-                    # Appearance check failed but CSRT still thinks it has
-                    # the object - likely a partial exit/occlusion. Keep
-                    # driving/tracking for a few frames rather than dropping
-                    # on one bad frame.
-                    lost_streak += 1
-                    apply_bbox(frame, bbox, args, car, driving_enabled)
-                else:
-                    tracker = None
-                    lost_streak = 0
-                    if car is not None:
-                        car.stop_moving()
-            elif signature is not None:
-                candidate = find_object(orb, matcher, frame, signature)
-                if candidate is not None:
-                    tracker = create_tracker()
-                    tracker.init(frame, candidate)
-                    apply_bbox(frame, candidate, args, car, driving_enabled)
-                else:
-                    if car is not None:
-                        car.stop_moving()
-                    draw_status(frame, "Object out of view - searching...", (0, 165, 255))
+            results = model.track(
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                classes=args.classes,
+                conf=args.conf,
+                device=device,
+                verbose=False,
+            )
+            detections = parse_detections(results)
+            box, track_id = select_target(detections, locked_id)
+            locked_id = track_id
+
+            if box is not None:
+                bbox = xyxy_to_xywh(box)
+                apply_bbox(frame, bbox, track_id, args, car, driving_enabled)
             else:
                 if car is not None:
                     car.stop_moving()
-                draw_status(frame, "Press 'r' to select an object to track")
+                if not args.classes:
+                    draw_status(frame, "Press 'r' to select an object to track")
+                else:
+                    draw_status(frame, "TARGET LOST - searching...", (0, 165, 255))
 
             cv2.imshow(window, frame)
             key = cv2.waitKey(1) & 0xFF
@@ -618,18 +600,16 @@ def main():
             if key == ord("q"):
                 break
             elif key == ord("r"):
-                lost_streak = 0
                 if car is not None:
                     car.stop_moving()
-                roi = cv2.selectROI(window, frame, fromCenter=False, showCrosshair=True)
-                if roi[2] > 0 and roi[3] > 0:
-                    tracker = create_tracker()
-                    tracker.init(frame, roi)
-                    signature = compute_signature(orb, frame, roi)
-                    driving_enabled = True
+                new_class = select_target_class(detector, frame, args.conf, device)
+                if new_class is None:
+                    print("Selection cancelled or no match; keeping current target.")
                 else:
-                    tracker = None
-                    signature = None
+                    args.classes = [new_class]
+                    locked_id = None
+                    driving_enabled = True
+                    print(f"Tracking class {new_class} ({model.names[new_class]}); acquiring biggest match...")
             elif key == ord("c"):
                 driving_enabled = not driving_enabled
                 print(f"Auto-drive {'enabled' if driving_enabled else 'disabled'}")

@@ -1,3 +1,6 @@
-opencv-contrib-python
+opencv-python
 numpy
 requests
+ultralytics
+torch
+lap
