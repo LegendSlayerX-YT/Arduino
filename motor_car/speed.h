@@ -1,7 +1,13 @@
 #ifndef MOTOR_CAR_SPEED_H
 #define MOTOR_CAR_SPEED_H
 
+// Arduino Uno R4 WiFi uses the I2C Adafruit Motor Shield library; the Uno
+// WiFi Rev2 (and any other board) uses the AFMotor_R4 shield library.
+#if defined(ARDUINO_UNOWIFIR4)
+#include <Adafruit_MotorShield.h>
+#else
 #include "AFMotor_R4.h"
+#endif
 
 const int LF_IDX=0;
 const int RF_IDX=1;
@@ -73,6 +79,50 @@ const Speed FORWARD_MOVE(1,1,1,1);
 const Speed ROTATE_LEFT(-1,1,-1,1);
 const Speed SHIFT_LEFT(-1,1,1,-1);
 
+#if defined(ARDUINO_UNOWIFIR4)
+
+struct SpeedControl {
+    int low_bound[4];
+    int high_bound[4];
+    Adafruit_MotorShield shield;
+    Adafruit_DCMotor* motor[4];
+
+    SpeedControl(
+        int motor_idx[4],
+        int low_bound[4],
+        int high_bound[4]
+    ) {
+        for (int i = 0; i < 4; i++) {
+            this->low_bound[i] = low_bound[i];
+            this->high_bound[i] = high_bound[i];
+            motor[i] = shield.getMotor(motor_idx[i]);
+        }
+    }
+
+    // Must be called from setup(), after Serial/Wire are ready, unlike the
+    // AFMotor_R4 version which initializes the controller lazily.
+    bool begin() {
+        return shield.begin();
+    }
+
+    void apply_speed(const Speed& speed) {
+        for (int i = 0; i< 4; i++) {
+            float abs_speed = min(fabs(speed[i]), 1);
+            if (abs_speed < 1e-3) {
+                motor[i]->run(RELEASE);
+                continue;
+            }
+
+            motor[i]->run((speed[i] > 0) ? FORWARD: BACKWARD);
+            motor[i]->setSpeed(
+                static_cast<int>( (high_bound[i] - low_bound[i]) * abs_speed + low_bound[i] )
+            );
+        }
+    }
+};
+
+#else
+
 struct SpeedControl {
     int low_bound[4];
     int high_bound[4];
@@ -91,7 +141,7 @@ struct SpeedControl {
         for (int i = 0; i < 4; i++) {
             this->low_bound[i] = low_bound[i];
             this->high_bound[i] = high_bound[i];
-        }        
+        }
     }
 
     void apply_speed(const Speed& speed) {
@@ -101,13 +151,15 @@ struct SpeedControl {
                 motor[i].run(RELEASE);
                 continue;
             }
-            
+
             motor[i].run((speed[i] > 0) ? FORWARD: BACKWARD);
             motor[i].setSpeed(
-                static_cast<int>( (high_bound[i] - low_bound[i]) * abs_speed + low_bound[i] ) 
+                static_cast<int>( (high_bound[i] - low_bound[i]) * abs_speed + low_bound[i] )
             );
         }
     }
 };
+
+#endif
 
 #endif

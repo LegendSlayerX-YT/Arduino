@@ -3,15 +3,21 @@
 
 
 #include "speed.h"
+
+#if defined(ARDUINO_UNOWIFIR4)
+#include "WiFiS3_Wrapper.h"
+using MyWifi = MyWifiS3;
+#else
 #include "WiFiNINA_Wrapper.h"
+#endif
 
 MyWifi wifi;
 
 int motor_idx[4]={3, 4, 2, 1};
-int low_bound[4]={50, 50, 
-    50, 50};
-int high_bound[4]={204, 220, 
-    176, 220};
+int low_bound[4]={0, 0, 
+    0, 0};
+int high_bound[4]={220, 220,
+    220, 220};
 SpeedControl motor_control(
   motor_idx,
   low_bound,
@@ -56,8 +62,12 @@ float clamp(float value, float low, float high) {
 }
 
 void setup() {
-  Serial.begin(9600);           
+  Serial.begin(9600);
   Serial.println("Basic Motor Test!");
+
+#if defined(ARDUINO_UNOWIFIR4)
+  motor_control.begin();
+#endif
 
   wifi.connect("MOTO1AAE", "8xpf8x4uru");
 
@@ -89,6 +99,12 @@ void loop() {
     }
     else if (request.code == 200 && request.data == "/right") {
       start_move(speed - ROTATE_LEFT * 0.15);
+    }
+    else if (request.code == 200 && request.data == "/shift_left") {
+      start_move(speed + SHIFT_LEFT * 0.3);
+    }
+    else if (request.code == 200 && request.data == "/shift_right") {
+      start_move(speed - SHIFT_LEFT * 0.3);
     }
     else if (request.code == 200 && request.data == "/stop") {
       stop_move();
