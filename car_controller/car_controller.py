@@ -484,9 +484,9 @@ def main():
         "If given, the car auto-drives to keep the tracked object centered.",
     )
     parser.add_argument("--car-port", type=int, default=80, help="Motor car HTTP port (default 80)")
-    parser.add_argument("--kp-left", type=float, default=0.15, help="Proportional gain for left/right rotation correction")
-    parser.add_argument("--kp-shift", type=float, default=0.6, help="Proportional gain for lateral shift correction")
-    parser.add_argument("--kp-forward", type=float, default=0.6, help="Proportional gain for forward/back distance correction")
+    parser.add_argument("--kp-left", type=float, default=0.10, help="Proportional gain for left/right rotation correction")
+    parser.add_argument("--kp-shift", type=float, default=0.5, help="Proportional gain for lateral shift correction")
+    parser.add_argument("--kp-forward", type=float, default=0.5, help="Proportional gain for forward/back distance correction")
     parser.add_argument("--deadzone-x", type=float, default=0.15, help="Horizontal dead zone as a fraction of half frame width")
     parser.add_argument(
         "--quarter-threshold",

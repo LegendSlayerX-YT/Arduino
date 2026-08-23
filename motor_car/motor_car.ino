@@ -14,9 +14,11 @@ using MyWifi = MyWifiS3;
 MyWifi wifi;
 
 int motor_idx[4]={3, 4, 2, 1};
-int low_bound[4]={0, 0, 
-    0, 0};
-int high_bound[4]={220, 220,
+int low_bound[4]={
+    30, 30, 
+    30, 30};
+int high_bound[4]={
+    220, 220,
     220, 220};
 SpeedControl motor_control(
   motor_idx,

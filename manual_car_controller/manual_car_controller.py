@@ -23,8 +23,8 @@ CAR_PORT = "80"
 KEY_TO_ENDPOINT = {
     "up": "up",
     "down": "down",
-    "left": "left",
-    "right": "right",
+    "left": "shift_left",
+    "right": "shift_right",
     "stop": "stop",
 }
 
