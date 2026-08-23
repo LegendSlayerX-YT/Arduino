@@ -25,7 +25,10 @@ time to pick a different object (and class) to track.
 When --car-host is given, it also drives the car via the motor board's
 /move?forward=&left= endpoint to keep the locked object centered (rotating
 in place to correct left/right offset, and optionally driving forward/back
-to hold the object's on-screen size).
+to hold the object's on-screen size). If the tracked object goes out of
+frame, after a brief grace period the car slowly rotates in place (toward
+whichever side the object was last seen drifting off to) to search for it,
+instead of just sitting still.
 
 Usage:
     python car_controller.py --host 192.168.1.50
@@ -503,7 +506,7 @@ def main():
     parser.add_argument(
         "--min-move",
         type=float,
-        default=0.1,
+        default=0.02,
         help="Forward/left values below this magnitude are snapped to 0 (motor can't overcome "
         "static friction below it, so it just strains without moving the car) (default 0.08)",
     )
@@ -523,6 +526,19 @@ def main():
         "--no-follow-distance",
         action="store_true",
         help="Only rotate to correct left/right; don't drive forward/back to hold distance",
+    )
+    parser.add_argument(
+        "--search-speed",
+        type=float,
+        default=0.04,
+        help="Rotation magnitude used to search for the object once it's lost, 0-1 (default 0.06)",
+    )
+    parser.add_argument(
+        "--search-grace",
+        type=float,
+        default=0.75,
+        help="Seconds to wait after losing the object before starting the search rotation, to "
+        "ride out momentary detection misses instead of spinning on every dropped frame (default 0.75)",
     )
     args = parser.parse_args()
 
@@ -550,6 +566,8 @@ def main():
     window = "ESP32-CAM Object Tracker"
     locked_id = None
     driving_enabled = True
+    last_drift_sign = 1
+    lost_since = None
 
     car = None
     if args.car_host:
@@ -585,13 +603,28 @@ def main():
 
             if box is not None:
                 bbox = xyxy_to_xywh(box)
+                frame_w = frame.shape[1]
+                dx_norm = (bbox[0] + bbox[2] / 2 - frame_w / 2) / (frame_w / 2)
+                if sign(dx_norm) != 0:
+                    last_drift_sign = sign(dx_norm)
+                lost_since = None
                 apply_bbox(frame, bbox, track_id, args, car, driving_enabled)
             else:
-                if car is not None:
-                    car.stop_moving()
                 if not args.classes:
+                    if car is not None:
+                        car.stop_moving()
+                    lost_since = None
                     draw_status(frame, "Press 'r' to select an object to track")
                 else:
+                    if lost_since is None:
+                        lost_since = time.time()
+                    if car is not None:
+                        if driving_enabled and time.time() - lost_since >= args.search_grace:
+                            # Keep rotating the way the object was last seen drifting off,
+                            # so the search pans toward where it's likely to reappear.
+                            car.set_target(0.0, -last_drift_sign * args.search_speed, 0.0)
+                        else:
+                            car.stop_moving()
                     draw_status(frame, "TARGET LOST - searching...", (0, 165, 255))
 
             cv2.imshow(window, frame)
@@ -609,6 +642,7 @@ def main():
                     args.classes = [new_class]
                     locked_id = None
                     driving_enabled = True
+                    lost_since = None
                     print(f"Tracking class {new_class} ({model.names[new_class]}); acquiring biggest match...")
             elif key == ord("c"):
                 driving_enabled = not driving_enabled
