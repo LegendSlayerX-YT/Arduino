@@ -55,6 +55,9 @@ If the feed is too dark, try (AI-Thinker board has an onboard flash LED):
 
 For more vivid color:
     python car_controller.py --host 192.168.1.50 --saturation 2 --contrast 1
+
+For a higher-resolution stream (adds latency; see --framesize for other sizes):
+    python car_controller.py --host 192.168.1.50 --framesize svga
 """
 
 import argparse
@@ -124,6 +127,26 @@ class StreamReader:
 
     def stop(self):
         self._running = False
+
+
+# ESP32 camera framesize_t values (esp32-camera sensor.h), settable via
+# /control?var=framesize&val=N. Higher resolution means more detail for YOLO
+# to detect but more network/decode latency and a lower effective frame rate,
+# so this is left as an explicit opt-in rather than the default.
+FRAMESIZES = {
+    "qqvga": 1,  # 160x120
+    "qcif": 2,  # 176x144
+    "hqvga": 3,  # 240x176
+    "qvga": 5,  # 320x240
+    "cif": 6,  # 400x296
+    "hvga": 7,  # 480x320
+    "vga": 8,  # 640x480
+    "svga": 9,  # 800x600
+    "xga": 10,  # 1024x768
+    "hd": 11,  # 1280x720
+    "sxga": 12,  # 1280x1024
+    "uxga": 13,  # 1600x1200 (max for OV2640, the AI-Thinker board's sensor)
+}
 
 
 def set_control(host, var, val):
@@ -465,6 +488,13 @@ def main():
     parser.add_argument("--host", required=True, help="ESP32-CAM IP address, e.g. 192.168.1.50")
     parser.add_argument("--port", type=int, default=81, help="Stream server port (default 81)")
     parser.add_argument("--led", type=int, help="Onboard flash LED intensity, 0-255 (AI-Thinker board only)")
+    parser.add_argument(
+        "--framesize",
+        choices=sorted(FRAMESIZES, key=FRAMESIZES.get),
+        help="Camera stream resolution (default: whatever the camera is currently set to). "
+        "Higher resolutions add network/decode latency and lower the effective frame rate; "
+        "vga (640x480) or svga (800x600) is a reasonable step up without much of a hit.",
+    )
     parser.add_argument("--ae-level", type=int, choices=range(-2, 3), help="Auto exposure target level, -2 to 2")
     parser.add_argument("--brightness", type=int, choices=range(-2, 3), help="Brightness offset, -2 to 2")
     parser.add_argument("--saturation", type=int, choices=range(-2, 3), help="Color saturation, -2 to 2")
@@ -542,6 +572,8 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.framesize is not None:
+        set_control(args.host, "framesize", FRAMESIZES[args.framesize])
     if args.led is not None:
         set_control(args.host, "led_intensity", args.led)
     if args.ae_level is not None:
