@@ -4,15 +4,21 @@ with optional closed-loop driving of the motor car (see motor_car/motor_car.ino)
 to keep the tracked object centered in frame.
 
 Connects to the camera board's MJPEG stream (served on port 81 at /stream)
-and runs YOLOv8 object detection + ByteTrack on every frame (mirroring
-object_tracker/tracker.py) instead of a classic single-object CV tracker.
-The detector re-finds objects from scratch each frame, so there's no drift
-and no manual ROI to draw.
+and runs YOLO-World open-vocabulary object detection + ByteTrack on every
+frame (mirroring object_tracker/tracker.py) instead of a classic
+single-object CV tracker. The detector re-finds objects from scratch each
+frame, so there's no drift and no manual ROI to draw.
+
+Unlike plain YOLOv8, YOLO-World isn't limited to the 80 COCO classes: the
+set of detectable classes ("vocabulary") is given as free-text prompts via
+--vocab (default: the standard COCO class names, for parity with the old
+behavior), so odd objects that aren't in COCO (e.g. "earth globe", "bicycle
+helmet") can be detected by adding them to --vocab.
 
 Selection logic: at startup no object class is fixed, so nothing is
 detected or tracked yet. Press 'r' to drag a box around the object you
-want; a one-off, class-unfiltered detection pass matches (by IoU) whatever
-overlaps that box to figure out its COCO class, and detection is then
+want; a one-off, vocabulary-unfiltered detection pass matches (by IoU)
+whatever overlaps that box to figure out its class, and detection is then
 narrowed to just that class from then on (e.g. selecting a person
 restricts every later frame to detecting people). Once a class is set, if
 nothing is locked yet the tracker locks onto whichever detection of that
@@ -26,9 +32,10 @@ When --car-host is given, it also drives the car via the motor board's
 /move?forward=&left= endpoint to keep the locked object centered (rotating
 in place to correct left/right offset, and optionally driving forward/back
 to hold the object's on-screen size). If the tracked object goes out of
-frame, after a brief grace period the car slowly rotates in place (toward
-whichever side the object was last seen drifting off to) to search for it,
-instead of just sitting still.
+frame, after a brief grace period the car searches for it by pulsing: a
+short rotation burst (toward whichever side the object was last seen
+drifting off to) followed by a pause, repeated, instead of spinning
+continuously or just sitting still.
 
 Usage:
     python car_controller.py --host 192.168.1.50
@@ -37,9 +44,13 @@ Usage:
     python car_controller.py --host 192.168.1.50 --car-host 192.168.1.60
     (also drive the car to keep the locked object centered)
 
-    python car_controller.py --host 192.168.1.50 --classes 0
-    (skip the 'r' selection step and start tracking COCO class 0 (person)
+    python car_controller.py --host 192.168.1.50 --classes person
+    (skip the 'r' selection step and start tracking the "person" class
     directly; pressing 'r' still lets you switch to a different object/class)
+
+    python car_controller.py --host 192.168.1.50 --vocab "earth globe" "bicycle helmet" person
+    (widen the detectable vocabulary beyond COCO to include custom objects;
+    --classes labels must be present in --vocab)
 
 Controls:
     r - drag a box around the object to track; a one-off detection pass
@@ -133,20 +144,42 @@ class StreamReader:
 # /control?var=framesize&val=N. Higher resolution means more detail for YOLO
 # to detect but more network/decode latency and a lower effective frame rate,
 # so this is left as an explicit opt-in rather than the default.
+# NOTE: these indices must match the framesize_t enum order in the esp32-camera
+# version the firmware was built against (currently installed core: 3.3.11,
+# which inserts FRAMESIZE_128X128 and FRAMESIZE_320X320 versus older releases).
 FRAMESIZES = {
     "qqvga": 1,  # 160x120
-    "qcif": 2,  # 176x144
-    "hqvga": 3,  # 240x176
-    "qvga": 5,  # 320x240
-    "cif": 6,  # 400x296
-    "hvga": 7,  # 480x320
-    "vga": 8,  # 640x480
-    "svga": 9,  # 800x600
-    "xga": 10,  # 1024x768
-    "hd": 11,  # 1280x720
-    "sxga": 12,  # 1280x1024
-    "uxga": 13,  # 1600x1200 (max for OV2640, the AI-Thinker board's sensor)
+    "qcif": 3,  # 176x144
+    "hqvga": 4,  # 240x176
+    "qvga": 6,  # 320x240
+    "cif": 8,  # 400x296
+    "hvga": 9,  # 480x320
+    "vga": 10,  # 640x480
+    "svga": 11,  # 800x600
+    "xga": 12,  # 1024x768
+    "hd": 13,  # 1280x720
+    "sxga": 14,  # 1280x1024
+    "uxga": 15,  # 1600x1200 (max for OV2640, the AI-Thinker board's sensor)
 }
+
+
+# Default open-vocabulary prompt set for YOLO-World, matching the standard
+# 80 COCO class names so behavior is unchanged unless --vocab is overridden
+# with custom prompts (e.g. objects that aren't in COCO at all).
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra",
+    "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove",
+    "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+    "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush",
+]
 
 
 def set_control(host, var, val):
@@ -361,11 +394,12 @@ def iou(box_a, box_b):
 
 def select_target_class(detector, frame, conf, device, min_iou=0.1):
     """Lets the user drag a box around the object to track, then runs a
-    fresh, class-unfiltered detection pass on that same frame to figure out
-    which COCO class it belongs to - matching by IoU against the box's
-    position, since the continuously-tracked `detections` can't be used
-    here (before a class is selected, args.classes is empty, so nothing is
-    being detected yet to match against).
+    fresh, vocabulary-unfiltered detection pass on that same frame to figure
+    out which class (from the current --vocab) it belongs to - matching by
+    IoU against the box's position, since the continuously-tracked
+    `detections` can't be used here (before a class is selected,
+    args.classes is empty, so nothing is being detected yet to match
+    against).
 
     `detector` must be a separate YOLO instance from the one driving the
     persistent tracking loop: calling .track() on a model permanently
@@ -484,7 +518,7 @@ def apply_bbox(frame, bbox, track_id, args, car, driving_enabled):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ESP32-CAM live object tracker (YOLOv8 + ByteTrack)")
+    parser = argparse.ArgumentParser(description="ESP32-CAM live object tracker (YOLO-World + ByteTrack)")
     parser.add_argument("--host", required=True, help="ESP32-CAM IP address, e.g. 192.168.1.50")
     parser.add_argument("--port", type=int, default=81, help="Stream server port (default 81)")
     parser.add_argument("--led", type=int, help="Onboard flash LED intensity, 0-255 (AI-Thinker board only)")
@@ -499,15 +533,30 @@ def main():
     parser.add_argument("--brightness", type=int, choices=range(-2, 3), help="Brightness offset, -2 to 2")
     parser.add_argument("--saturation", type=int, choices=range(-2, 3), help="Color saturation, -2 to 2")
     parser.add_argument("--contrast", type=int, choices=range(-2, 3), help="Contrast, -2 to 2")
-    parser.add_argument("--model", default="yolov8n.pt", help="Ultralytics model weights (default yolov8n.pt)")
+    parser.add_argument(
+        "--model",
+        default="yolov8s-worldv2.pt",
+        help="Ultralytics model weights (default yolov8s-worldv2.pt, an open-vocabulary YOLO-World "
+        "model - unlike plain yolov8n.pt it isn't limited to the 80 COCO classes; see --vocab). "
+        "There's no 'n'-scale YOLO-World checkpoint, so this is heavier/slower than yolov8n.",
+    )
+    parser.add_argument(
+        "--vocab",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Open-vocabulary class prompts for YOLO-World, e.g. --vocab \"earth globe\" "
+        "\"bicycle helmet\" person (default: the standard 80 COCO class names, for parity with "
+        "plain YOLOv8). Only meaningful with a *-world*.pt --model.",
+    )
     parser.add_argument(
         "--classes",
-        type=int,
+        type=str,
         nargs="+",
         default=[],
-        help="Start tracking these COCO class ids immediately, skipping the 'r' selection step "
-        "(default: none - nothing is detected until you press 'r'). Pressing 'r' overrides this "
-        "to whichever single class you select.",
+        help="Start tracking these class labels (must be present in --vocab) immediately, "
+        "skipping the 'r' selection step (default: none - nothing is detected until you press "
+        "'r'). Pressing 'r' overrides this to whichever single class you select.",
     )
     parser.add_argument("--conf", type=float, default=0.2, help="Detection confidence threshold (default 0.2)")
     parser.add_argument("--device", help="Inference device, e.g. mps/cuda/cpu (default: auto-detect)")
@@ -570,6 +619,18 @@ def main():
         help="Seconds to wait after losing the object before starting the search rotation, to "
         "ride out momentary detection misses instead of spinning on every dropped frame (default 0.75)",
     )
+    parser.add_argument(
+        "--search-burst",
+        type=float,
+        default=0.5,
+        help="Seconds to rotate for during each search pulse (default 0.5)",
+    )
+    parser.add_argument(
+        "--search-pause",
+        type=float,
+        default=0.5,
+        help="Seconds to sit still between search rotation pulses (default 0.5)",
+    )
     args = parser.parse_args()
 
     if args.framesize is not None:
@@ -595,11 +656,33 @@ def main():
     # persistent tracking loop's ByteTrack state on `model` isn't disturbed.
     detector = YOLO(args.model)
 
+    if hasattr(model, "set_classes"):
+        vocab = args.vocab if args.vocab is not None else COCO_CLASSES
+        print(f"Setting vocabulary ({len(vocab)} classes) ...")
+        model.set_classes(vocab)
+        detector.set_classes(vocab)
+    else:
+        # Plain (non-world) model, e.g. --model yolov8n.pt: no open vocabulary
+        # to set, so --classes labels must match its fixed built-in names.
+        if args.vocab is not None:
+            parser.error(f"--vocab requires an open-vocabulary *-world*.pt --model, not {args.model!r}")
+        vocab = list(model.names.values())
+
+    name_to_id = {name: i for i, name in enumerate(vocab)}
+    class_ids = []
+    for label in args.classes:
+        if label not in name_to_id:
+            parser.error(f"--classes label {label!r} not in vocabulary; add it via --vocab")
+        class_ids.append(name_to_id[label])
+    args.classes = class_ids
+
     window = "ESP32-CAM Object Tracker"
     locked_id = None
     driving_enabled = True
     last_drift_sign = 1
     lost_since = None
+    search_phase_start = None
+    search_bursting = True
 
     car = None
     if args.car_host:
@@ -640,21 +723,38 @@ def main():
                 if sign(dx_norm) != 0:
                     last_drift_sign = sign(dx_norm)
                 lost_since = None
+                search_phase_start = None
+                search_bursting = True
                 apply_bbox(frame, bbox, track_id, args, car, driving_enabled)
             else:
                 if not args.classes:
                     if car is not None:
                         car.stop_moving()
                     lost_since = None
+                    search_phase_start = None
+                    search_bursting = True
                     draw_status(frame, "Press 'r' to select an object to track")
                 else:
                     if lost_since is None:
                         lost_since = time.time()
                     if car is not None:
                         if driving_enabled and time.time() - lost_since >= args.search_grace:
-                            # Keep rotating the way the object was last seen drifting off,
-                            # so the search pans toward where it's likely to reappear.
-                            car.set_target(0.0, -last_drift_sign * args.search_speed, 0.0)
+                            # Pulse: rotate for --search-burst seconds, then sit still for
+                            # --search-pause seconds, repeating, rather than spinning
+                            # continuously. Keep rotating the way the object was last seen
+                            # drifting off, so each burst pans toward where it's likely to
+                            # reappear.
+                            now = time.time()
+                            if search_phase_start is None:
+                                search_phase_start = now
+                            phase_duration = args.search_burst if search_bursting else args.search_pause
+                            if now - search_phase_start >= phase_duration:
+                                search_bursting = not search_bursting
+                                search_phase_start = now
+                            if search_bursting:
+                                car.set_target(0.0, -last_drift_sign * args.search_speed, 0.0)
+                            else:
+                                car.stop_moving()
                         else:
                             car.stop_moving()
                     draw_status(frame, "TARGET LOST - searching...", (0, 165, 255))
@@ -675,6 +775,8 @@ def main():
                     locked_id = None
                     driving_enabled = True
                     lost_since = None
+                    search_phase_start = None
+                    search_bursting = True
                     print(f"Tracking class {new_class} ({model.names[new_class]}); acquiring biggest match...")
             elif key == ord("c"):
                 driving_enabled = not driving_enabled
