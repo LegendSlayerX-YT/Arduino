@@ -5,7 +5,7 @@
 #include "DFRobotDFPlayerMini.h"
 
 // DFPlayer Mini serial connection.
-SoftwareSerial mySoftwareSerial(9, 10);  // RX, TX
+SoftwareSerial mySoftwareSerial(11, 10);  // RX, TX
 DFRobotDFPlayerMini myDFPlayer;
 
 // Control pins.
@@ -93,6 +93,10 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Start Waiting");
   delay(10000);
+  
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+  
   mySoftwareSerial.begin(9600);
 
   Serial.println();
