@@ -558,7 +558,7 @@ def main():
         "skipping the 'r' selection step (default: none - nothing is detected until you press "
         "'r'). Pressing 'r' overrides this to whichever single class you select.",
     )
-    parser.add_argument("--conf", type=float, default=0.2, help="Detection confidence threshold (default 0.2)")
+    parser.add_argument("--conf", type=float, default=0.05, help="Detection confidence threshold (default 0.2)")
     parser.add_argument("--device", help="Inference device, e.g. mps/cuda/cpu (default: auto-detect)")
     parser.add_argument(
         "--car-host",
