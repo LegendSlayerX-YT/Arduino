@@ -43,23 +43,21 @@ void updateVolume() {
 
 void handlePauseButton() {
   int reading = digitalRead(PAUSE_BUTTON_PIN);
-
-  if (reading != lastPauseReading) {
-    lastPauseDebounceTime = millis();
+  
+  if (reading == lastPauseReading) {
+    Serial.println("pause");
+    Serial.println(reading);
+    return;
   }
 
-  if ((millis() - lastPauseDebounceTime) > DEBOUNCE_MS && reading != pauseButtonState) {
-    pauseButtonState = reading;
-
-    if (pauseButtonState == LOW) {
-      isPaused = !isPaused;
-      if (isPaused) {
-        myDFPlayer.pause();
-        Serial.println(F("Paused"));
-      } else {
-        myDFPlayer.start();
-        Serial.println(F("Resumed"));
-      }
+  if (reading == LOW) {
+    isPaused = !isPaused;
+    if (isPaused) {
+      myDFPlayer.pause();
+      Serial.println(F("Paused"));
+    } else {
+      myDFPlayer.start();
+      Serial.println(F("Resumed"));
     }
   }
 
@@ -69,18 +67,16 @@ void handlePauseButton() {
 void handleNextButton() {
   int reading = digitalRead(NEXT_BUTTON_PIN);
 
-  if (reading != lastNextReading) {
-    lastNextDebounceTime = millis();
+  if (reading == lastNextReading){
+    Serial.println("next");
+    Serial.println(reading);
+    return;
   }
 
-  if ((millis() - lastNextDebounceTime) > DEBOUNCE_MS && reading != nextButtonState) {
-    nextButtonState = reading;
-
-    if (nextButtonState == LOW) {
-      myDFPlayer.next();
-      isPaused = false;
-      Serial.println(F("Next track"));
-    }
+  if (reading == LOW) {
+    myDFPlayer.next();
+    isPaused = false;
+    Serial.println(F("Next track"));
   }
 
   lastNextReading = reading;
@@ -165,4 +161,5 @@ void loop() {
   updateVolume();
   handlePauseButton();
   handleNextButton();
+  delay(100);
 }
